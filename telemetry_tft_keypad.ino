@@ -389,12 +389,6 @@ void updateTelemetry() {
 void drawFrame() {
   spr.fillSprite(TFT_BLACK);
 
-  if (linkState == STATE_CONNECTING) {
-    drawStatusScreen("Ucaga Baglaniliyor...");
-    spr.pushSprite(0, 0);
-    return;
-  }
-
   drawTopBar();
   drawUpperMiddle();
   drawSpeedRow();
@@ -459,8 +453,12 @@ void drawTopBar() {
   drawCenteredText(modeName(), 190, 21, 1, TFT_WHITE);
 
   drawCenteredText("SIGNAL", 270, 8, 1, POWDER_BLUE);
-  drawSignalBars(236, 16, data.signal);
-  drawRightText(String(data.signal) + "%", 315, 21, 1, TFT_WHITE);
+  if (linkState == STATE_CONNECTED) {
+    drawSignalBars(236, 16, data.signal);
+    drawRightText(String(data.signal) + "%", 315, 21, 1, TFT_WHITE);
+  } else {
+    drawCenteredText("SINYAL YOK", 270, 21, 1, TFT_WHITE);
+  }
 }
 
 void drawUpperMiddle() {

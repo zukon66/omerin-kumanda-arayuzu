@@ -2,6 +2,7 @@
 #include <TFT_eSPI.h>
 #include <SPI.h>
 #include <Keypad.h>
+#include <RF24.h>
 
 TFT_eSPI tft = TFT_eSPI();
 TFT_eSprite spr = TFT_eSprite(&tft);
@@ -12,6 +13,19 @@ static const int SCREEN_W = 320;
 static const int SCREEN_H = 240;
 static const unsigned long POPUP_MS = 1500;
 static const int UI_BACKLIGHT_PIN = -1;
+static const int NRF_CE_PIN = 22;
+static const int NRF_CSN_PIN = 15;
+static const int JOY_THROTTLE_PIN = 34;
+static const int JOY_YAW_PIN = 35;
+static const int JOY_PITCH_PIN = 36;
+static const int JOY_ROLL_PIN = 39;
+static const int ENCODER_A_PIN = 16;
+static const int ENCODER_B_PIN = 17;
+static const int JOY_CENTER = 2048;
+static const int JOY_DEADZONE = 150;
+static const unsigned long RADIO_TX_MS = 40;
+static const unsigned long LINK_TIMEOUT_MS = 1000;
+static const unsigned long CONNECTED_BANNER_MS = 1000;
 
 const byte ROWS = 4;
 const byte COLS = 4;
@@ -27,6 +41,66 @@ byte rowPins[ROWS] = {13, 14, 27, 26};
 byte colPins[COLS] = {25, 33, 32, 21};
 
 Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+RF24 radio(NRF_CE_PIN, NRF_CSN_PIN);
+
+const byte RADIO_ADDRESS[6] = "UAV01";
+
+enum LinkState {
+  STATE_CONNECTING,
+  STATE_CONNECTED,
+  STATE_DISCONNECTED
+};
+
+struct __attribute__((packed)) TX_Payload {
+  uint16_t throttlePwm;
+  uint16_t yawPwm;
+  uint16_t pitchPwm;
+  uint16_t rollPwm;
+  int16_t encoderValue;
+  uint8_t activeKeyId;
+  uint8_t packetId;
+};
+
+struct __attribute__((packed)) RX_Payload {
+  uint16_t aircraftBatteryMv;
+  uint8_t satellites;
+  uint16_t speedKmh;
+  int16_t altitudeM;
+  uint16_t headingDeg;
+  int32_t latitudeE7;
+  int32_t longitudeE7;
+  int16_t rollDeg10;
+  int16_t pitchDeg10;
+  uint8_t signalPercent;
+  uint32_t distanceM;
+  uint16_t pressureHpa;
+  int16_t cameraAngleDeg;
+};
+
+static_assert(sizeof(TX_Payload) <= 32, "TX payload too large");
+static_assert(sizeof(RX_Payload) <= 32, "RX payload too large");
+
+TX_Payload txPayload = {1500, 1500, 1500, 1500, 0, 0, 0};
+RX_Payload rxPayload = {3700, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1013, 0};
+
+LinkState linkState = STATE_CONNECTING;
+bool radioReady = false;
+bool telemetryValid = false;
+uint8_t activeKeyId = 0;
+unsigned long lastRadioTxAt = 0;
+unsigned long lastAckAt = 0;
+unsigned long connectedBannerUntil = 0;
+volatile int16_t encoderTicks = 0;
+volatile uint8_t encoderLastState = 0;
+
+void IRAM_ATTR encoderIsr();
+void setupRadio();
+void readControlInputs();
+uint16_t readJoystickPwm(int pin);
+void serviceRadio();
+void updateLinkState();
+void drawStatusScreen(const String &message);
+void drawStatusOverlay(const String &message);
 
 struct TelemetryData {
   int satellites;
@@ -39,6 +113,7 @@ struct TelemetryData {
   int speed;
   int distance;
   int cameraAngle;
+  int heading;
   float latitude;
   float longitude;
   float roll;
@@ -65,7 +140,16 @@ void setup() {
     digitalWrite(UI_BACKLIGHT_PIN, HIGH);
   }
 
-  randomSeed(analogRead(34));
+  pinMode(JOY_THROTTLE_PIN, INPUT);
+  pinMode(JOY_YAW_PIN, INPUT);
+  pinMode(JOY_PITCH_PIN, INPUT);
+  pinMode(JOY_ROLL_PIN, INPUT);
+  analogReadResolution(12);
+  pinMode(ENCODER_A_PIN, INPUT_PULLUP);
+  pinMode(ENCODER_B_PIN, INPUT_PULLUP);
+  encoderLastState = (digitalRead(ENCODER_A_PIN) << 1) | digitalRead(ENCODER_B_PIN);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_A_PIN), encoderIsr, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_B_PIN), encoderIsr, CHANGE);
 
   tft.init();
   tft.setRotation(1);
@@ -89,6 +173,7 @@ void setup() {
   spr.setTextDatum(MC_DATUM);
   spr.setSwapBytes(true);
 
+  setupRadio();
   updateTelemetry();
   drawFrame();
   Serial.println("UI ready");
@@ -96,10 +181,13 @@ void setup() {
 
 void loop() {
   handleKeypad();
+  readControlInputs();
+  serviceRadio();
+  updateLinkState();
   handlePopupTimer();
 
   unsigned long now = millis();
-  if (now - lastTelemetryAt >= 500) {
+  if (now - lastTelemetryAt >= 100) {
     updateTelemetry();
     lastTelemetryAt = now;
   }
@@ -107,6 +195,106 @@ void loop() {
   if (now - lastFrameAt >= 50) {
     drawFrame();
     lastFrameAt = now;
+  }
+}
+
+void IRAM_ATTR encoderIsr() {
+  uint8_t state = (digitalRead(ENCODER_A_PIN) << 1) | digitalRead(ENCODER_B_PIN);
+  uint8_t transition = (encoderLastState << 2) | state;
+
+  if (transition == 0b0001 || transition == 0b0111 || transition == 0b1110 || transition == 0b1000) {
+    encoderTicks++;
+  } else if (transition == 0b0010 || transition == 0b0100 || transition == 0b1101 || transition == 0b1011) {
+    encoderTicks--;
+  }
+
+  encoderLastState = state;
+}
+
+void setupRadio() {
+  radioReady = radio.begin();
+  if (!radioReady) {
+    Serial.println("RF24 begin failed");
+    return;
+  }
+
+  radio.setAutoAck(true);
+  radio.enableAckPayload();
+  radio.enableDynamicPayloads();
+  radio.setRetries(3, 5);
+  radio.setPALevel(RF24_PA_LOW);
+  radio.setDataRate(RF24_1MBPS);
+  radio.setChannel(108);
+  radio.openWritingPipe(RADIO_ADDRESS);
+  radio.stopListening();
+  Serial.println("RF24 ready");
+}
+
+void readControlInputs() {
+  txPayload.throttlePwm = readJoystickPwm(JOY_THROTTLE_PIN);
+  txPayload.yawPwm = readJoystickPwm(JOY_YAW_PIN);
+  txPayload.pitchPwm = readJoystickPwm(JOY_PITCH_PIN);
+  txPayload.rollPwm = readJoystickPwm(JOY_ROLL_PIN);
+
+  noInterrupts();
+  int16_t ticks = encoderTicks;
+  interrupts();
+
+  txPayload.encoderValue = ticks;
+  txPayload.activeKeyId = activeKeyId;
+}
+
+uint16_t readJoystickPwm(int pin) {
+  int raw = analogRead(pin);
+  raw = constrain(raw, 0, 4095);
+
+  if (abs(raw - JOY_CENTER) <= JOY_DEADZONE) {
+    return 1500;
+  }
+
+  return constrain(map(raw, 0, 4095, 1000, 2000), 1000, 2000);
+}
+
+void serviceRadio() {
+  unsigned long now = millis();
+  if (!radioReady || now - lastRadioTxAt < RADIO_TX_MS) {
+    return;
+  }
+
+  lastRadioTxAt = now;
+  txPayload.packetId++;
+
+  bool sent = radio.write(&txPayload, sizeof(txPayload));
+  if (sent && radio.isAckPayloadAvailable()) {
+    uint8_t payloadSize = radio.getDynamicPayloadSize();
+    if (payloadSize == sizeof(rxPayload)) {
+      radio.read(&rxPayload, sizeof(rxPayload));
+      telemetryValid = true;
+      lastAckAt = now;
+    } else {
+      radio.flush_rx();
+    }
+  }
+}
+
+void updateLinkState() {
+  unsigned long now = millis();
+
+  if (telemetryValid && linkState == STATE_CONNECTING) {
+    linkState = STATE_CONNECTED;
+    connectedBannerUntil = now + CONNECTED_BANNER_MS;
+    Serial.println("Link connected");
+  }
+
+  if (telemetryValid && linkState == STATE_DISCONNECTED && now - lastAckAt <= LINK_TIMEOUT_MS) {
+    linkState = STATE_CONNECTED;
+    connectedBannerUntil = now + CONNECTED_BANNER_MS;
+    Serial.println("Link restored");
+  }
+
+  if (linkState == STATE_CONNECTED && now - lastAckAt > LINK_TIMEOUT_MS) {
+    linkState = STATE_DISCONNECTED;
+    Serial.println("Link lost failsafe");
   }
 }
 
@@ -122,6 +310,7 @@ void handleKeypad() {
   }
 
   setPopupText(index);
+  activeKeyId = index;
   popupStartedAt = millis();
   popupActive = true;
 }
@@ -180,35 +369,74 @@ void setPopupText(int index) {
 }
 
 void updateTelemetry() {
-  data.satellites = random(7, 18);
-  data.aircraftBattery = random(42, 101);
-  data.controllerBattery = random(55, 101);
-  data.signal = random(45, 101);
-  data.throttle = random(0, 101);
-  data.altitude = random(0, 500);
-  data.pressure = random(980, 1035);
-  data.speed = random(0, 146);
-  data.distance = random(0, 12000);
-  data.cameraAngle = random(-45, 46);
-  data.latitude = 41.0000f + (float)random(-5000, 5000) / 100000.0f;
-  data.longitude = 29.0000f + (float)random(-5000, 5000) / 100000.0f;
-  data.roll = (float)random(-300, 301) / 10.0f;
-  data.pitch = (float)random(-200, 201) / 10.0f;
+  data.satellites = rxPayload.satellites;
+  data.aircraftBattery = constrain(map(rxPayload.aircraftBatteryMv, 3300, 4200, 0, 100), 0, 100);
+  data.controllerBattery = 100;
+  data.signal = constrain(rxPayload.signalPercent, 0, 100);
+  data.throttle = constrain(map(txPayload.throttlePwm, 1000, 2000, 0, 100), 0, 100);
+  data.altitude = rxPayload.altitudeM;
+  data.pressure = rxPayload.pressureHpa;
+  data.speed = rxPayload.speedKmh;
+  data.distance = rxPayload.distanceM;
+  data.cameraAngle = rxPayload.cameraAngleDeg;
+  data.heading = rxPayload.headingDeg;
+  data.latitude = (float)rxPayload.latitudeE7 / 10000000.0f;
+  data.longitude = (float)rxPayload.longitudeE7 / 10000000.0f;
+  data.roll = (float)rxPayload.rollDeg10 / 10.0f;
+  data.pitch = (float)rxPayload.pitchDeg10 / 10.0f;
 }
 
 void drawFrame() {
   spr.fillSprite(TFT_BLACK);
+
+  if (linkState == STATE_CONNECTING) {
+    drawStatusScreen("Ucaga Baglaniliyor...");
+    spr.pushSprite(0, 0);
+    return;
+  }
 
   drawTopBar();
   drawUpperMiddle();
   drawSpeedRow();
   drawBottomBar();
 
+  if (linkState == STATE_CONNECTED && millis() < connectedBannerUntil) {
+    drawStatusOverlay("Baglanti Basarili");
+  }
+
+  if (linkState == STATE_DISCONNECTED) {
+    drawStatusOverlay("BAGLANTI KOPTU - FAILSAFE");
+  }
+
   if (popupActive) {
     drawPopup();
   }
 
   spr.pushSprite(0, 0);
+}
+
+void drawStatusScreen(const String &message) {
+  int x = 45;
+  int y = 80;
+  int w = 230;
+  int h = 80;
+
+  spr.fillSprite(TFT_BLACK);
+  spr.drawRect(x, y, w, h, POWDER_BLUE);
+  spr.drawRect(x + 3, y + 3, w - 6, h - 6, POWDER_BLUE);
+  drawCenteredText(message, SCREEN_W / 2, SCREEN_H / 2, 2, POWDER_BLUE);
+}
+
+void drawStatusOverlay(const String &message) {
+  int x = 25;
+  int y = 70;
+  int w = 270;
+  int h = 100;
+
+  spr.fillRect(x, y, w, h, TFT_BLACK);
+  spr.drawRect(x, y, w, h, POWDER_BLUE);
+  spr.drawRect(x + 3, y + 3, w - 6, h - 6, POWDER_BLUE);
+  drawCenteredText(message, SCREEN_W / 2, SCREEN_H / 2, 2, TFT_WHITE);
 }
 
 void drawTopBar() {

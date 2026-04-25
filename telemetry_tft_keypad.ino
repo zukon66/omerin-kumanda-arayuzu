@@ -86,10 +86,13 @@ RX_Payload rxPayload = {3700, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1013, 0};
 LinkState linkState = STATE_CONNECTING;
 bool radioReady = false;
 bool telemetryValid = false;
+bool isConnected = false;
 uint8_t activeKeyId = 0;
 unsigned long lastRadioTxAt = 0;
 unsigned long lastAckAt = 0;
 unsigned long connectedBannerUntil = 0;
+bool signalLossPopupActive = false;
+unsigned long signalLossPopupStartedAt = 0;
 volatile int16_t encoderTicks = 0;
 volatile uint8_t encoderLastState = 0;
 
@@ -101,6 +104,7 @@ void serviceRadio();
 void updateLinkState();
 void drawStatusScreen(const String &message);
 void drawStatusOverlay(const String &message);
+void drawSignalLossPopup();
 
 struct TelemetryData {
   int satellites;
@@ -282,18 +286,23 @@ void updateLinkState() {
 
   if (telemetryValid && linkState == STATE_CONNECTING) {
     linkState = STATE_CONNECTED;
+    isConnected = true;
     connectedBannerUntil = now + CONNECTED_BANNER_MS;
     Serial.println("Link connected");
   }
 
   if (telemetryValid && linkState == STATE_DISCONNECTED && now - lastAckAt <= LINK_TIMEOUT_MS) {
     linkState = STATE_CONNECTED;
+    isConnected = true;
     connectedBannerUntil = now + CONNECTED_BANNER_MS;
     Serial.println("Link restored");
   }
 
   if (linkState == STATE_CONNECTED && now - lastAckAt > LINK_TIMEOUT_MS) {
     linkState = STATE_DISCONNECTED;
+    isConnected = false;
+    signalLossPopupActive = true;
+    signalLossPopupStartedAt = now;
     Serial.println("Link lost failsafe");
   }
 }
@@ -318,6 +327,10 @@ void handleKeypad() {
 void handlePopupTimer() {
   if (popupActive && millis() - popupStartedAt >= POPUP_MS) {
     popupActive = false;
+  }
+
+  if (signalLossPopupActive && millis() - signalLossPopupStartedAt >= POPUP_MS) {
+    signalLossPopupActive = false;
   }
 }
 
@@ -369,6 +382,25 @@ void setPopupText(int index) {
 }
 
 void updateTelemetry() {
+  if (!isConnected) {
+    data.satellites = 0;
+    data.aircraftBattery = 0;
+    data.controllerBattery = 0;
+    data.signal = 0;
+    data.throttle = 0;
+    data.altitude = 0;
+    data.pressure = 0;
+    data.speed = 0;
+    data.distance = 0;
+    data.cameraAngle = 0;
+    data.heading = 0;
+    data.latitude = 0.0f;
+    data.longitude = 0.0f;
+    data.roll = 0.0f;
+    data.pitch = 0.0f;
+    return;
+  }
+
   data.satellites = rxPayload.satellites;
   data.aircraftBattery = constrain(map(rxPayload.aircraftBatteryMv, 3300, 4200, 0, 100), 0, 100);
   data.controllerBattery = 100;
@@ -394,16 +426,12 @@ void drawFrame() {
   drawSpeedRow();
   drawBottomBar();
 
-  if (linkState == STATE_CONNECTED && millis() < connectedBannerUntil) {
-    drawStatusOverlay("Baglanti Basarili");
-  }
-
-  if (linkState == STATE_DISCONNECTED) {
-    drawStatusOverlay("BAGLANTI KOPTU - FAILSAFE");
-  }
-
   if (popupActive) {
     drawPopup();
+  }
+
+  if (signalLossPopupActive) {
+    drawSignalLossPopup();
   }
 
   spr.pushSprite(0, 0);
@@ -433,6 +461,18 @@ void drawStatusOverlay(const String &message) {
   drawCenteredText(message, SCREEN_W / 2, SCREEN_H / 2, 2, TFT_WHITE);
 }
 
+void drawSignalLossPopup() {
+  int x = 80;
+  int y = 85;
+  int w = 160;
+  int h = 70;
+
+  spr.fillRect(x, y, w, h, TFT_BLACK);
+  spr.drawRect(x, y, w, h, POWDER_BLUE);
+  spr.drawRect(x + 3, y + 3, w - 6, h - 6, POWDER_BLUE);
+  drawCenteredText("SINYAL KAYBI", x + w / 2, y + h / 2, 2, TFT_WHITE);
+}
+
 void drawTopBar() {
   drawBox(0, 0, 40, 30);
   drawBox(40, 0, 60, 30);
@@ -452,12 +492,14 @@ void drawTopBar() {
   drawCenteredText("MOD", 190, 8, 1, POWDER_BLUE);
   drawCenteredText(modeName(), 190, 21, 1, TFT_WHITE);
 
-  drawCenteredText("SIGNAL", 270, 8, 1, POWDER_BLUE);
-  if (linkState == STATE_CONNECTED) {
+  if (isConnected) {
+    drawCenteredText("BAGLANDI", 270, 8, 1, POWDER_BLUE);
     drawSignalBars(236, 16, data.signal);
     drawRightText(String(data.signal) + "%", 315, 21, 1, TFT_WHITE);
   } else {
-    drawCenteredText("SINYAL YOK", 270, 21, 1, TFT_WHITE);
+    drawCenteredText(telemetryValid ? "DISCONN" : "BAGLI DEGIL", 270, 8, 1, POWDER_BLUE);
+    drawSignalBars(236, 16, 0);
+    drawRightText("0%", 315, 21, 1, TFT_WHITE);
   }
 }
 

@@ -1,3 +1,4 @@
+#include <Arduino.h>
 #include <TFT_eSPI.h>
 #include <SPI.h>
 #include <Keypad.h>
@@ -10,6 +11,7 @@ TFT_eSprite spr = TFT_eSprite(&tft);
 static const int SCREEN_W = 320;
 static const int SCREEN_H = 240;
 static const unsigned long POPUP_MS = 1500;
+static const int UI_BACKLIGHT_PIN = -1;
 
 const byte ROWS = 4;
 const byte COLS = 4;
@@ -21,8 +23,8 @@ char keys[ROWS][COLS] = {
   {'*', '0', '#', 'D'}
 };
 
-byte rowPins[ROWS] = {13, 12, 14, 27};
-byte colPins[COLS] = {26, 25, 33, 32};
+byte rowPins[ROWS] = {13, 14, 27, 26};
+byte colPins[COLS] = {25, 33, 32, 21};
 
 Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 
@@ -54,19 +56,42 @@ unsigned long lastFrameAt = 0;
 
 void setup() {
   Serial.begin(115200);
+  delay(300);
+  Serial.println();
+  Serial.println("ESP32 TFT UI boot");
+
+  if (UI_BACKLIGHT_PIN >= 0) {
+    pinMode(UI_BACKLIGHT_PIN, OUTPUT);
+    digitalWrite(UI_BACKLIGHT_PIN, HIGH);
+  }
+
   randomSeed(analogRead(34));
 
   tft.init();
   tft.setRotation(1);
   tft.fillScreen(TFT_BLACK);
 
-  spr.setColorDepth(16);
-  spr.createSprite(SCREEN_W, SCREEN_H);
+  Serial.printf("Free heap before sprite: %u\n", ESP.getFreeHeap());
+  spr.setColorDepth(8);
+  void *spriteBuffer = spr.createSprite(SCREEN_W, SCREEN_H);
+  if (!spriteBuffer) {
+    Serial.println("Sprite allocation failed");
+    while (true) {
+      tft.fillScreen(TFT_BLACK);
+      tft.setTextColor(TFT_RED, TFT_BLACK);
+      tft.setTextDatum(MC_DATUM);
+      tft.drawString("SPRITE FAIL", SCREEN_W / 2, SCREEN_H / 2, 2);
+      delay(1000);
+    }
+  }
+  Serial.printf("Free heap after sprite: %u\n", ESP.getFreeHeap());
+
   spr.setTextDatum(MC_DATUM);
   spr.setSwapBytes(true);
 
   updateTelemetry();
   drawFrame();
+  Serial.println("UI ready");
 }
 
 void loop() {

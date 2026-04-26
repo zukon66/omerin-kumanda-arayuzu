@@ -26,6 +26,10 @@ static const int JOY_DEADZONE = 150;
 static const unsigned long RADIO_TX_MS = 40;
 static const unsigned long LINK_TIMEOUT_MS = 1000;
 static const unsigned long CONNECTED_BANNER_MS = 1000;
+static const int RADAR_POINTS = 64;
+static const float RADAR_METERS_PER_PIXEL = 5.0f;
+static const unsigned long RADAR_SAMPLE_MS = 500;
+static const unsigned long POWER_SLEEP_HOLD_MS = 3000;
 
 const byte ROWS = 4;
 const byte COLS = 4;
@@ -49,6 +53,11 @@ enum LinkState {
   STATE_CONNECTING,
   STATE_CONNECTED,
   STATE_DISCONNECTED
+};
+
+enum SystemState {
+  STATE_BOOTING,
+  STATE_RUNNING
 };
 
 struct __attribute__((packed)) TX_Payload {
@@ -83,28 +92,66 @@ static_assert(sizeof(RX_Payload) <= 32, "RX payload too large");
 TX_Payload txPayload = {1500, 1500, 1500, 1500, 0, 0, 0};
 RX_Payload rxPayload = {3700, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1013, 0};
 
+SystemState systemState = STATE_BOOTING;
 LinkState linkState = STATE_CONNECTING;
 bool radioReady = false;
+bool radioChipConnected = false;
 bool telemetryValid = false;
 bool isConnected = false;
 uint8_t activeKeyId = 0;
+uint8_t currentPage = 0;
+uint8_t flightMode = 2;
+uint8_t lightMode = 0;
+bool safetyLocked = true;
+bool logEnabled = false;
+bool levelFlightEnabled = false;
+bool findPlaneEnabled = false;
+bool sleepPending = false;
 unsigned long lastRadioTxAt = 0;
 unsigned long lastAckAt = 0;
 unsigned long connectedBannerUntil = 0;
+unsigned long flightStartAt = 0;
+unsigned long lastRadarSampleAt = 0;
+unsigned long sleepHoldStartedAt = 0;
 bool signalLossPopupActive = false;
 unsigned long signalLossPopupStartedAt = 0;
+int rawThrottleAdc = 0;
+int rawYawAdc = 0;
+int rawPitchAdc = 0;
+int rawRollAdc = 0;
+int maxSpeed = 0;
+int maxAltitude = 0;
+float homeLatitude = 0.0f;
+float homeLongitude = 0.0f;
+bool homeSet = false;
+int radarX[RADAR_POINTS];
+int radarY[RADAR_POINTS];
+uint8_t radarHead = 0;
+uint8_t radarCount = 0;
 volatile int16_t encoderTicks = 0;
 volatile uint8_t encoderLastState = 0;
 
 void IRAM_ATTR encoderIsr();
+void runSafeBoot();
 void setupRadio();
 void readControlInputs();
 uint16_t readJoystickPwm(int pin);
 void serviceRadio();
 void updateLinkState();
+void handlePowerSleepHold();
+void processKeyFunction(int index);
+void setPopupMessage(const char *text);
+void addRadarPoint();
 void drawStatusScreen(const String &message);
 void drawStatusOverlay(const String &message);
 void drawSignalLossPopup();
+void drawMainTelemetryScreen();
+void drawRadarPage();
+void drawDebugPage();
+void drawStatsPage();
+void drawPageHeader(const String &title);
+void drawBootLine(int row, const String &label, const String &status, uint16_t color);
+void drawBootProgress(int percent);
 
 struct TelemetryData {
   int satellites;
@@ -144,17 +191,6 @@ void setup() {
     digitalWrite(UI_BACKLIGHT_PIN, HIGH);
   }
 
-  pinMode(JOY_THROTTLE_PIN, INPUT);
-  pinMode(JOY_YAW_PIN, INPUT);
-  pinMode(JOY_PITCH_PIN, INPUT);
-  pinMode(JOY_ROLL_PIN, INPUT);
-  analogReadResolution(12);
-  pinMode(ENCODER_A_PIN, INPUT_PULLUP);
-  pinMode(ENCODER_B_PIN, INPUT_PULLUP);
-  encoderLastState = (digitalRead(ENCODER_A_PIN) << 1) | digitalRead(ENCODER_B_PIN);
-  attachInterrupt(digitalPinToInterrupt(ENCODER_A_PIN), encoderIsr, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(ENCODER_B_PIN), encoderIsr, CHANGE);
-
   tft.init();
   tft.setRotation(1);
   tft.fillScreen(TFT_BLACK);
@@ -164,20 +200,20 @@ void setup() {
   void *spriteBuffer = spr.createSprite(SCREEN_W, SCREEN_H);
   if (!spriteBuffer) {
     Serial.println("Sprite allocation failed");
-    while (true) {
-      tft.fillScreen(TFT_BLACK);
-      tft.setTextColor(TFT_RED, TFT_BLACK);
-      tft.setTextDatum(MC_DATUM);
-      tft.drawString("SPRITE FAIL", SCREEN_W / 2, SCREEN_H / 2, 2);
-      delay(1000);
-    }
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString("SPRITE FAIL", SCREEN_W / 2, SCREEN_H / 2, 2);
+    spr.createSprite(1, 1);
   }
   Serial.printf("Free heap after sprite: %u\n", ESP.getFreeHeap());
 
   spr.setTextDatum(MC_DATUM);
   spr.setSwapBytes(true);
 
-  setupRadio();
+  runSafeBoot();
+  systemState = STATE_RUNNING;
+  flightStartAt = millis();
   updateTelemetry();
   drawFrame();
   Serial.println("UI ready");
@@ -188,6 +224,7 @@ void loop() {
   readControlInputs();
   serviceRadio();
   updateLinkState();
+  handlePowerSleepHold();
   handlePopupTimer();
 
   unsigned long now = millis();
@@ -215,10 +252,71 @@ void IRAM_ATTR encoderIsr() {
   encoderLastState = state;
 }
 
+void runSafeBoot() {
+  spr.fillSprite(TFT_BLACK);
+  drawCenteredText("SAFE BOOT", SCREEN_W / 2, 14, 2, POWDER_BLUE);
+  drawBootProgress(0);
+  spr.pushSprite(0, 0);
+  delay(120);
+
+  SPI.begin();
+  bool spiReady = true;
+  if (spiReady) {
+    drawBootLine(0, "SPI BUS", "[READY]", POWDER_BLUE);
+  } else {
+    drawBootLine(0, "SPI BUS", "[FAIL]", TFT_RED);
+  }
+  drawBootProgress(25);
+  spr.pushSprite(0, 0);
+  delay(120);
+
+  pinMode(JOY_THROTTLE_PIN, INPUT);
+  pinMode(JOY_YAW_PIN, INPUT);
+  pinMode(JOY_PITCH_PIN, INPUT);
+  pinMode(JOY_ROLL_PIN, INPUT);
+  analogReadResolution(12);
+  pinMode(ENCODER_A_PIN, INPUT_PULLUP);
+  pinMode(ENCODER_B_PIN, INPUT_PULLUP);
+  encoderLastState = (digitalRead(ENCODER_A_PIN) << 1) | digitalRead(ENCODER_B_PIN);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_A_PIN), encoderIsr, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_B_PIN), encoderIsr, CHANGE);
+  drawBootLine(1, "JOY ENCODER", "[READY]", POWDER_BLUE);
+  drawBootProgress(50);
+  spr.pushSprite(0, 0);
+  delay(120);
+
+  drawBootLine(2, "KEYPAD", "[READY]", POWDER_BLUE);
+  drawBootProgress(70);
+  spr.pushSprite(0, 0);
+  delay(120);
+
+  setupRadio();
+  if (radioChipConnected) {
+    drawBootLine(3, "NRF24L01", "[READY]", POWDER_BLUE);
+  } else {
+    drawBootLine(3, "NRF24L01", "NOT FOUND SKIP", TFT_RED);
+  }
+  drawBootProgress(90);
+  spr.pushSprite(0, 0);
+  delay(120);
+
+  drawBootLine(4, "SYSTEM", "[RUN]", POWDER_BLUE);
+  drawBootProgress(100);
+  spr.pushSprite(0, 0);
+  delay(250);
+}
+
 void setupRadio() {
   radioReady = radio.begin();
   if (!radioReady) {
     Serial.println("RF24 begin failed");
+    return;
+  }
+
+  radioChipConnected = radio.isChipConnected();
+  if (!radioChipConnected) {
+    radioReady = false;
+    Serial.println("nRF24L01: NOT FOUND! SKIPPING...");
     return;
   }
 
@@ -251,6 +349,16 @@ void readControlInputs() {
 uint16_t readJoystickPwm(int pin) {
   int raw = analogRead(pin);
   raw = constrain(raw, 0, 4095);
+
+  if (pin == JOY_THROTTLE_PIN) {
+    rawThrottleAdc = raw;
+  } else if (pin == JOY_YAW_PIN) {
+    rawYawAdc = raw;
+  } else if (pin == JOY_PITCH_PIN) {
+    rawPitchAdc = raw;
+  } else if (pin == JOY_ROLL_PIN) {
+    rawRollAdc = raw;
+  }
 
   if (abs(raw - JOY_CENTER) <= JOY_DEADZONE) {
     return 1500;
@@ -318,10 +426,119 @@ void handleKeypad() {
     return;
   }
 
-  setPopupText(index);
+  processKeyFunction(index);
   activeKeyId = index;
   popupStartedAt = millis();
   popupActive = true;
+}
+
+void processKeyFunction(int index) {
+  sleepPending = false;
+
+  switch (index) {
+    case 1:
+      flightMode = 1;
+      setPopupMessage("MODE TURTLE");
+      break;
+    case 2:
+      flightMode = 2;
+      setPopupMessage("MODE NORMAL");
+      break;
+    case 3:
+      flightMode = 3;
+      setPopupMessage("MODE SPORT");
+      break;
+    case 4:
+      flightMode = 4;
+      setPopupMessage("MODE ECO");
+      break;
+    case 5:
+      lightMode = (lightMode + 1) % 3;
+      if (lightMode == 0) {
+        setPopupMessage("LIGHTS OFF");
+      } else if (lightMode == 1) {
+        setPopupMessage("LIGHTS ON");
+      } else {
+        setPopupMessage("LIGHTS STROBE");
+      }
+      break;
+    case 6:
+      setPopupMessage("RTH ACTIVE");
+      break;
+    case 7:
+      if (isConnected) {
+        homeLatitude = data.latitude;
+        homeLongitude = data.longitude;
+        homeSet = true;
+        radarHead = 0;
+        radarCount = 0;
+        setPopupMessage("HOME SAVED");
+      } else {
+        setPopupMessage("NO GPS DATA");
+      }
+      break;
+    case 8:
+      if (safetyLocked) {
+        setPopupMessage("CALIBRATE IMU");
+      } else {
+        setPopupMessage("LOCK MOTOR");
+      }
+      break;
+    case 9:
+      findPlaneEnabled = !findPlaneEnabled;
+      setPopupMessage(findPlaneEnabled ? "FIND PLANE ON" : "FIND PLANE OFF");
+      break;
+    case 10:
+      setPopupMessage("ZERO ALT");
+      break;
+    case 11:
+      setPopupMessage("TRIM SAVED");
+      break;
+    case 12:
+      levelFlightEnabled = !levelFlightEnabled;
+      setPopupMessage(levelFlightEnabled ? "LEVEL ON" : "LEVEL OFF");
+      break;
+    case 13:
+      safetyLocked = !safetyLocked;
+      setPopupMessage(safetyLocked ? "SAFETY LOCK" : "SAFETY FREE");
+      break;
+    case 14:
+      currentPage = (currentPage + 1) % 4;
+      setPopupMessage("NEXT PAGE");
+      break;
+    case 15:
+      logEnabled = !logEnabled;
+      setPopupMessage(logEnabled ? "LOG DATA ON" : "LOG DATA OFF");
+      break;
+    case 16:
+      sleepPending = true;
+      sleepHoldStartedAt = millis();
+      setPopupMessage("HOLD FOR SLEEP");
+      break;
+  }
+}
+
+void handlePowerSleepHold() {
+  if (!sleepPending) {
+    return;
+  }
+
+  if (!keypad.isPressed('D')) {
+    sleepPending = false;
+    return;
+  }
+
+  if (millis() - sleepHoldStartedAt >= POWER_SLEEP_HOLD_MS) {
+    setPopupMessage("POWER SLEEP");
+    popupStartedAt = millis();
+    popupActive = true;
+    sleepPending = false;
+  }
+}
+
+void setPopupMessage(const char *text) {
+  strncpy(popupText, text, sizeof(popupText) - 1);
+  popupText[sizeof(popupText) - 1] = '\0';
 }
 
 void handlePopupTimer() {
@@ -354,31 +571,6 @@ int keyToIndex(char key) {
     case 'D': return 16;
     default: return 0;
   }
-}
-
-void setPopupText(int index) {
-  const char *text = "";
-  switch (index) {
-    case 1: text = "TURTLE MOD"; break;
-    case 2: text = "NORMAL MOD"; break;
-    case 3: text = "SPORT MOD"; break;
-    case 4: text = "ECO MOD"; break;
-    case 5: text = "ISIKLAR KAPALI"; break;
-    case 6: text = "ISIKLAR ACIK"; break;
-    case 7: text = "FLASOR MOD"; break;
-    case 8: text = "KAMERA YUKARI"; break;
-    case 9: text = "HOMEPOINT OK"; break;
-    case 10: text = "KALIBRASYON"; break;
-    case 11: text = "UCAGI BUL"; break;
-    case 12: text = "KAMERA ASAGI"; break;
-    case 13: text = "RAKIM SIFIRLA"; break;
-    case 14: text = "EMNIRET AKTIF"; break;
-    case 15: text = "DUZ TUT AKTIF"; break;
-    case 16: text = "UYKU MODU"; break;
-  }
-
-  strncpy(popupText, text, sizeof(popupText) - 1);
-  popupText[sizeof(popupText) - 1] = '\0';
 }
 
 void updateTelemetry() {
@@ -416,15 +608,32 @@ void updateTelemetry() {
   data.longitude = (float)rxPayload.longitudeE7 / 10000000.0f;
   data.roll = (float)rxPayload.rollDeg10 / 10.0f;
   data.pitch = (float)rxPayload.pitchDeg10 / 10.0f;
+
+  if (data.speed > maxSpeed) {
+    maxSpeed = data.speed;
+  }
+  if (data.altitude > maxAltitude) {
+    maxAltitude = data.altitude;
+  }
+
+  if (homeSet && millis() - lastRadarSampleAt >= RADAR_SAMPLE_MS) {
+    addRadarPoint();
+    lastRadarSampleAt = millis();
+  }
 }
 
 void drawFrame() {
   spr.fillSprite(TFT_BLACK);
 
-  drawTopBar();
-  drawUpperMiddle();
-  drawSpeedRow();
-  drawBottomBar();
+  if (currentPage == 0) {
+    drawMainTelemetryScreen();
+  } else if (currentPage == 1) {
+    drawRadarPage();
+  } else if (currentPage == 2) {
+    drawDebugPage();
+  } else {
+    drawStatsPage();
+  }
 
   if (popupActive) {
     drawPopup();
@@ -435,6 +644,121 @@ void drawFrame() {
   }
 
   spr.pushSprite(0, 0);
+}
+
+void addRadarPoint() {
+  float dLat = (data.latitude - homeLatitude) * 111320.0f;
+  float dLon = (data.longitude - homeLongitude) * 111320.0f * cos(homeLatitude * DEG_TO_RAD);
+  int px = constrain((int)(dLon / RADAR_METERS_PER_PIXEL), -105, 105);
+  int py = constrain((int)(-dLat / RADAR_METERS_PER_PIXEL), -80, 80);
+
+  radarX[radarHead] = px;
+  radarY[radarHead] = py;
+  radarHead = (radarHead + 1) % RADAR_POINTS;
+  if (radarCount < RADAR_POINTS) {
+    radarCount++;
+  }
+}
+
+void drawMainTelemetryScreen() {
+  drawTopBar();
+  drawUpperMiddle();
+  drawSpeedRow();
+  drawBottomBar();
+}
+
+void drawRadarPage() {
+  drawPageHeader("PAGE 1 RADAR");
+  int cx = SCREEN_W / 2;
+  int cy = 128;
+  int radius = 82;
+
+  spr.drawCircle(cx, cy, radius, POWDER_BLUE);
+  spr.drawCircle(cx, cy, radius / 2, TFT_DARKGREY);
+  spr.drawLine(cx - radius, cy, cx + radius, cy, TFT_DARKGREY);
+  spr.drawLine(cx, cy - radius, cx, cy + radius, TFT_DARKGREY);
+  drawCenteredText("HOME", cx, cy + 10, 1, POWDER_BLUE);
+  spr.fillCircle(cx, cy, 3, POWDER_BLUE);
+
+  if (!homeSet) {
+    drawCenteredText("NO HOMEPOINT", cx, cy + 32, 2, TFT_WHITE);
+  } else {
+    for (uint8_t i = 0; i < radarCount; i++) {
+      uint8_t idx = (radarHead + RADAR_POINTS - radarCount + i) % RADAR_POINTS;
+      int x = cx + radarX[idx];
+      int y = cy + radarY[idx];
+      spr.drawPixel(x, y, POWDER_BLUE);
+      if (i == radarCount - 1) {
+        spr.fillCircle(x, y, 4, TFT_WHITE);
+      }
+    }
+  }
+
+  drawCenteredText("1PX 5M", 52, 225, 1, POWDER_BLUE);
+  drawCenteredText(isConnected ? "LINK OK" : "NO CONN", 268, 225, 1, POWDER_BLUE);
+}
+
+void drawDebugPage() {
+  drawPageHeader("PAGE 2 DEBUG");
+  spr.setTextDatum(TL_DATUM);
+  spr.setTextColor(TFT_WHITE, TFT_BLACK);
+  spr.drawString("THR ADC: " + String(rawThrottleAdc), 12, 42, 2);
+  spr.drawString("YAW ADC: " + String(rawYawAdc), 12, 64, 2);
+  spr.drawString("PIT ADC: " + String(rawPitchAdc), 12, 86, 2);
+  spr.drawString("ROL ADC: " + String(rawRollAdc), 12, 108, 2);
+  spr.drawString("ENCODER: " + String(txPayload.encoderValue), 12, 130, 2);
+  spr.drawString("KEY ID: " + String(activeKeyId), 12, 152, 2);
+  spr.drawString("PAGE: " + String(currentPage), 12, 174, 2);
+  spr.drawString(radioChipConnected ? "NRF24: CONNECTED" : "NRF24: DISCONNECTED", 12, 196, 2);
+  spr.drawString(isConnected ? "ACK: OK" : "ACK: NONE", 180, 42, 2);
+  spr.drawString("PKT: " + String(txPayload.packetId), 180, 64, 2);
+  spr.drawString("RSSI: " + String(data.signal), 180, 86, 2);
+}
+
+void drawStatsPage() {
+  drawPageHeader("PAGE 3 STATS");
+  unsigned long elapsed = (millis() - flightStartAt) / 1000;
+  unsigned long mm = elapsed / 60;
+  unsigned long ss = elapsed % 60;
+
+  drawBox(20, 45, 280, 45);
+  drawBox(20, 100, 280, 45);
+  drawBox(20, 155, 280, 45);
+
+  drawCenteredText("MAX SPEED", 90, 62, 2, POWDER_BLUE);
+  drawCenteredText(String(maxSpeed) + " KMH", 220, 62, 2, TFT_WHITE);
+  drawCenteredText("MAX ALT", 90, 117, 2, POWDER_BLUE);
+  drawCenteredText(String(maxAltitude) + " M", 220, 117, 2, TFT_WHITE);
+  drawCenteredText("TIME", 90, 172, 2, POWDER_BLUE);
+  drawCenteredText(String(mm) + ":" + (ss < 10 ? "0" : "") + String(ss), 220, 172, 2, TFT_WHITE);
+  drawCenteredText(logEnabled ? "LOG ON" : "LOG OFF", 160, 225, 1, POWDER_BLUE);
+}
+
+void drawPageHeader(const String &title) {
+  drawBox(0, 0, SCREEN_W, 30);
+  drawCenteredText(title, SCREEN_W / 2, 15, 2, POWDER_BLUE);
+  drawCenteredText("P" + String(currentPage), 300, 15, 1, TFT_WHITE);
+}
+
+void drawBootLine(int row, const String &label, const String &status, uint16_t color) {
+  int y = 42 + row * 28;
+  spr.setTextDatum(TL_DATUM);
+  spr.setTextColor(POWDER_BLUE, TFT_BLACK);
+  spr.drawString(label, 18, y, 2);
+  spr.setTextDatum(TR_DATUM);
+  spr.setTextColor(color, TFT_BLACK);
+  spr.drawString(status, 302, y, 2);
+}
+
+void drawBootProgress(int percent) {
+  int x = 20;
+  int y = 218;
+  int w = 280;
+  int h = 12;
+  int fillW = map(constrain(percent, 0, 100), 0, 100, 0, w - 2);
+  spr.drawRect(x, y, w, h, POWDER_BLUE);
+  spr.fillRect(x + 1, y + 1, w - 2, h - 2, TFT_BLACK);
+  spr.fillRect(x + 1, y + 1, fillW, h - 2, POWDER_BLUE);
 }
 
 void drawStatusScreen(const String &message) {
@@ -572,13 +896,16 @@ void drawPercent(int value, int x, int y) {
 }
 
 const char *modeName() {
-  if (data.speed < 25) {
+  if (flightMode == 1) {
+    return "TURT";
+  }
+  if (flightMode == 3) {
+    return "SPRT";
+  }
+  if (flightMode == 4) {
     return "ECO";
   }
-  if (data.speed < 80) {
-    return "NORM";
-  }
-  return "SPORT";
+  return "NORM";
 }
 
 void drawSignalBars(int x, int y, int value) {

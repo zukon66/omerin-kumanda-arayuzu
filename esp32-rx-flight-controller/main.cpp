@@ -6,7 +6,6 @@
 #include <TinyGPS++.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
-#include "RadioPayloads.h"
 
 #define I2C_SDA_PIN 21
 #define I2C_SCL_PIN 22
@@ -48,6 +47,25 @@
 #define ADC_MAX_COUNT 4095.0f
 #define BATTERY_DIVIDER_RATIO 2.0f
 #define BATTERY_ADC_SAMPLES 8
+
+struct RX_Command {
+  uint16_t throttle;
+  uint16_t roll;
+  uint16_t pitch;
+  uint16_t yaw;
+  uint8_t flightMode;
+  uint8_t toggleCommand;
+};
+
+struct TX_Telemetry {
+  float batteryVoltage;
+  uint8_t satelliteCount;
+  float speedKmh;
+  float altitudeM;
+  float gpsCourseDeg;
+  float rollDeg;
+  float pitchDeg;
+};
 
 RF24 radio(NRF_CE_PIN, NRF_CSN_PIN);
 Servo esc;
@@ -124,21 +142,21 @@ void applyFailsafe() {
   writeOutputs(PWM_MIN_US, PWM_CENTER_US, PWM_CENTER_US, PWM_CENTER_US);
 }
 
-void applyCommand(const RX_Command &command) {
-  uint16_t throttle = clampPwm(command.throttle);
-  uint16_t maxThrottle = escLimitForMode(command.flightMode);
+void applyCommand() {
+  uint16_t throttle = clampPwm(rxCommand.throttle);
+  uint16_t maxThrottle = escLimitForMode(rxCommand.flightMode);
 
   if (throttle > maxThrottle) {
     throttle = maxThrottle;
   }
 
-  buzzerRequested = (command.toggleCommand == TOGGLE_BUZZER);
+  buzzerRequested = (rxCommand.toggleCommand == TOGGLE_BUZZER);
 
   writeOutputs(
     throttle,
-    clampPwm(command.roll),
-    clampPwm(command.pitch),
-    clampPwm(command.yaw)
+    clampPwm(rxCommand.roll),
+    clampPwm(rxCommand.pitch),
+    clampPwm(rxCommand.yaw)
   );
 }
 
@@ -227,7 +245,7 @@ void handleRadio() {
     radio.read(&rxCommand, sizeof(rxCommand));
     lastPacketMs = millis();
     failsafeActive = false;
-    applyCommand(rxCommand);
+    applyCommand();
     radio.writeAckPayload(1, &telemetry, sizeof(telemetry));
   }
 }

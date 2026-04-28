@@ -6,6 +6,7 @@
 #include <TinyGPS++.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
+#include "RadioPayloads.h"
 
 #define I2C_SDA_PIN 21
 #define I2C_SCL_PIN 22
@@ -47,25 +48,6 @@
 #define ADC_MAX_COUNT 4095.0f
 #define BATTERY_DIVIDER_RATIO 2.0f
 #define BATTERY_ADC_SAMPLES 8
-
-struct RX_Command {
-  uint16_t throttle;
-  uint16_t roll;
-  uint16_t pitch;
-  uint16_t yaw;
-  uint8_t flightMode;
-  uint8_t toggleCommand;
-};
-
-struct TX_Telemetry {
-  float batteryVoltage;
-  uint8_t satelliteCount;
-  float speedKmh;
-  float altitudeM;
-  float gpsCourseDeg;
-  float rollDeg;
-  float pitchDeg;
-};
 
 RF24 radio(NRF_CE_PIN, NRF_CSN_PIN);
 Servo esc;

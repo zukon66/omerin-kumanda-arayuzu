@@ -48,24 +48,34 @@
 #define BATTERY_DIVIDER_RATIO 2.0f
 #define BATTERY_ADC_SAMPLES 8
 
-struct RX_Command {
-  uint16_t throttle;
-  uint16_t roll;
-  uint16_t pitch;
-  uint16_t yaw;
-  uint8_t flightMode;
-  uint8_t toggleCommand;
+struct __attribute__((packed)) TX_Payload {
+  uint16_t throttlePwm;
+  uint16_t yawPwm;
+  uint16_t pitchPwm;
+  uint16_t rollPwm;
+  int16_t encoderValue;
+  uint8_t activeKeyId;
+  uint8_t packetId;
 };
 
-struct TX_Telemetry {
-  float batteryVoltage;
-  uint8_t satelliteCount;
-  float speedKmh;
-  float altitudeM;
-  float gpsCourseDeg;
-  float rollDeg;
-  float pitchDeg;
+struct __attribute__((packed)) RX_Payload {
+  uint16_t aircraftBatteryMv;
+  uint8_t satellites;
+  uint16_t speedKmh;
+  int16_t altitudeM;
+  uint16_t headingDeg;
+  int32_t latitudeE7;
+  int32_t longitudeE7;
+  int16_t rollDeg10;
+  int16_t pitchDeg10;
+  uint8_t signalPercent;
+  uint32_t distanceM;
+  uint16_t pressureHpa;
+  int16_t cameraAngleDeg;
 };
+
+static_assert(sizeof(TX_Payload) <= 32, "TX payload too large");
+static_assert(sizeof(RX_Payload) <= 32, "RX payload too large");
 
 RF24 radio(NRF_CE_PIN, NRF_CSN_PIN);
 Servo esc;
@@ -76,25 +86,32 @@ TinyGPSPlus gps;
 Adafruit_MPU6050 mpu;
 HardwareSerial GPSSerial(2);
 
-const byte radioAddress[6] = "PLANE";
+const byte radioAddress[6] = "UAV01";
 
-RX_Command rxCommand = {
+TX_Payload rxCommand = {
   PWM_MIN_US,
   PWM_CENTER_US,
   PWM_CENTER_US,
   PWM_CENTER_US,
-  MODE_NORMAL,
-  TOGGLE_NONE
+  0,
+  0,
+  0
 };
 
-TX_Telemetry telemetry = {
-  0.0f,
+RX_Payload telemetry = {
+  3700,
   0,
-  0.0f,
-  0.0f,
-  0.0f,
-  0.0f,
-  0.0f
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  1013,
+  0
 };
 
 unsigned long lastPacketMs = 0;
@@ -143,20 +160,27 @@ void applyFailsafe() {
 }
 
 void applyCommand() {
-  uint16_t throttle = clampPwm(rxCommand.throttle);
-  uint16_t maxThrottle = escLimitForMode(rxCommand.flightMode);
+  uint8_t mode = MODE_NORMAL;
+  if (rxCommand.activeKeyId == 1) {
+    mode = MODE_TURTLE;
+  } else if (rxCommand.activeKeyId == 3) {
+    mode = MODE_SPORT;
+  }
+
+  uint16_t throttle = clampPwm(rxCommand.throttlePwm);
+  uint16_t maxThrottle = escLimitForMode(mode);
 
   if (throttle > maxThrottle) {
     throttle = maxThrottle;
   }
 
-  buzzerRequested = (rxCommand.toggleCommand == TOGGLE_BUZZER);
+  buzzerRequested = (rxCommand.activeKeyId == 9);
 
   writeOutputs(
     throttle,
-    clampPwm(rxCommand.roll),
-    clampPwm(rxCommand.pitch),
-    clampPwm(rxCommand.yaw)
+    clampPwm(rxCommand.rollPwm),
+    clampPwm(rxCommand.pitchPwm),
+    clampPwm(rxCommand.yawPwm)
   );
 }
 
@@ -229,13 +253,19 @@ void updateTelemetry() {
 
   lastTelemetryUpdateMs = now;
 
-  telemetry.batteryVoltage = readBatteryVoltage();
-  telemetry.satelliteCount = gps.satellites.isValid() ? gps.satellites.value() : 0;
-  telemetry.speedKmh = gps.speed.isValid() ? gps.speed.kmph() : 0.0f;
-  telemetry.altitudeM = gps.altitude.isValid() ? gps.altitude.meters() : 0.0f;
-  telemetry.gpsCourseDeg = gps.course.isValid() ? gps.course.deg() : 0.0f;
-  telemetry.rollDeg = rollAngleDeg;
-  telemetry.pitchDeg = pitchAngleDeg;
+  telemetry.aircraftBatteryMv = (uint16_t)constrain((int)(readBatteryVoltage() * 1000.0f), 0, 65535);
+  telemetry.satellites = gps.satellites.isValid() ? (uint8_t)constrain((int)gps.satellites.value(), 0, 255) : 0;
+  telemetry.speedKmh = gps.speed.isValid() ? (uint16_t)constrain((int)gps.speed.kmph(), 0, 65535) : 0;
+  telemetry.altitudeM = gps.altitude.isValid() ? (int16_t)constrain((int)gps.altitude.meters(), -32768, 32767) : 0;
+  telemetry.headingDeg = gps.course.isValid() ? (uint16_t)constrain((int)gps.course.deg(), 0, 359) : 0;
+  telemetry.latitudeE7 = gps.location.isValid() ? (int32_t)(gps.location.lat() * 10000000.0) : 0;
+  telemetry.longitudeE7 = gps.location.isValid() ? (int32_t)(gps.location.lng() * 10000000.0) : 0;
+  telemetry.rollDeg10 = (int16_t)constrain((int)(rollAngleDeg * 10.0f), -32768, 32767);
+  telemetry.pitchDeg10 = (int16_t)constrain((int)(pitchAngleDeg * 10.0f), -32768, 32767);
+  telemetry.signalPercent = 100;
+  telemetry.distanceM = 0;
+  telemetry.pressureHpa = 1013;
+  telemetry.cameraAngleDeg = 0;
 
   radio.writeAckPayload(1, &telemetry, sizeof(telemetry));
 }

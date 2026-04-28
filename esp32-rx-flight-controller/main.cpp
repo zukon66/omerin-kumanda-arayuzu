@@ -275,11 +275,6 @@ void setupImu() {
 }
 
 void setupOutputs() {
-  ESP32PWM::allocateTimer(0);
-  ESP32PWM::allocateTimer(1);
-  ESP32PWM::allocateTimer(2);
-  ESP32PWM::allocateTimer(3);
-
   esc.setPeriodHertz(50);
   servoRoll.setPeriodHertz(50);
   servoPitch.setPeriodHertz(50);
